@@ -10,24 +10,17 @@ class DiffusionNet(nn.Module):
         self.hidden_size = hidden_size
         self.t_embed = nn.Embedding(T, hidden_size)
 
-        # produce gamma and beta from t embedding
-        self.film = nn.Sequential(
-            nn.Linear(hidden_size, 2 * hidden_size),
-        )
-
         self.transformer = Transformer(hidden_size, n_layers, n_heads, dropout_rate, mlp_size)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # x: [B,N,D], t: [B]
-        te = self.t_embed(t)  # [B,D]
-        gb = self.film(te)  # [B,2D]
-        gamma, beta = gb.chunk(2, dim=-1)  # each [B,D]
+        # x: [B, N, D], t: [B]
+        te = self.t_embed(t)          # [B, D]
+        te = te.unsqueeze(1)          # [B, 1, D]
 
-        gamma = gamma.unsqueeze(1)  # [B,1,D]
-        beta = beta.unsqueeze(1)  # [B,1,D]
-
-        x = x * (1.0 + gamma) + beta
-        return self.transformer(x)
+        # prepend time token — lets attention propagate time info to all layers
+        x = torch.cat([te, x], dim=1) # [B, N+1, D]
+        x = self.transformer(x)
+        return x[:, 1:, :]            # [B, N, D] — strip time token
 
 
 def cosine_alpha_bar(T: int, s: float = 0.008, device=None):
@@ -57,6 +50,54 @@ def corrupt(x: torch.Tensor, t: torch.Tensor, alpha_bar: torch.Tensor):
     return zt, eps
 
 
+@torch.no_grad()
+def sample(diff_model, ae, n_samples, T, n_tokens, token_dim, device='cpu'):
+    """DDPM reverse sampling: noise → latent tokens → decoded images.
+
+    Implements the reverse diffusion process to generate images:
+    1. Start from pure Gaussian noise z_T ~ N(0, I) in latent token space
+    2. For t = T-1 down to 0: denoise one step using the trained DiffusionNet
+    3. Decode the final clean latent z_0 with the AE decoder
+
+    Args:
+        diff_model: trained DiffusionNet
+        ae: trained ConvAE (frozen, used only for decoding)
+        n_samples: number of images to generate
+        T: number of diffusion timesteps (must match training T)
+        n_tokens: number of tokens per sample (ae.n_tokens = 49)
+        token_dim: dimension per token (ae.token_dim = 64)
+        device: 'cpu', 'cuda', or 'mps'
+
+    Returns:
+        images: [n_samples, 1, 28, 28] tensor with pixel values in [0, 1]
+
+    TODO (you implement):
+        1. Precompute betas, alphas, alpha_bar using compute_alpha_bar(T, device)
+        2. Sample initial noise: z_t = torch.randn(n_samples, n_tokens, token_dim)
+        3. Reverse loop from t = T-1 down to 0:
+           a. Predict noise: eps_pred = diff_model(z_t, t_batch)
+           b. Compute DDPM mean:
+              coeff = beta_t / sqrt(1 - alpha_bar_t)
+              mean = (1 / sqrt(alpha_t)) * (z_t - coeff * eps_pred)
+           c. If t > 0: add noise z_{t-1} = mean + sqrt(beta_t) * N(0, I)
+              If t == 0: z_0 = mean (no noise at final step)
+        4. Decode: images = sigmoid(ae.decode(z_0))
+        5. Return images
+    """
+    diff_model.eval()
+    ae.eval()
+    betas, alphas, alpha_bar = compute_alpha_bar(T, device=device)
+    z = torch.randn(n_samples, n_tokens, token_dim).to(device)
+    for i in range(T-1, -1, -1):
+        eps_pred = diff_model(z, torch.full((n_samples,), i, device=device, dtype=torch.long))
+        coeff = betas[i] / torch.sqrt(1- alpha_bar[i])
+        mean = (1 / torch.sqrt(alphas[i])) * (z - coeff * eps_pred)
+        if i > 0:
+            z = mean + torch.sqrt(betas[i]) * torch.randn_like(mean)
+        else:
+            z = mean
+
+    return torch.sigmoid(ae.decode(z))
 
 def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float, device="cpu"):
     diff_model.to(device)
@@ -74,7 +115,7 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float, de
         total_items = 0
 
         for x_img, _ in train_dataloader:
-            x = x_img.to(device).view(x_img.size(0), -1)  # [B, 784]
+            x = x_img.to(device)  # [B, 1, 28, 28]
 
             with torch.no_grad():
                 z0 = ae.encode(x)  # [B, N, D]  (tokens)

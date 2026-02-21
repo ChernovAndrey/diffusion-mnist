@@ -2,6 +2,71 @@ import torch
 from torch import nn
 
 
+class RoPE(nn.Module):
+    """Rotary Position Embeddings.
+
+    Encodes relative position by rotating Q and K vectors in attention.
+    Each pair of adjacent dimensions gets a rotation at a different frequency.
+
+    Args:
+        dim: per-head dimension (must be even)
+        max_seq_len: maximum sequence length to precompute freqs for
+
+    Usage:
+        rope = RoPE(dim=16, max_seq_len=64)
+        q, k = rope(q, k)  # q, k shape: [B, n_heads, N, d_head]
+
+    TODO (you implement):
+        1. In __init__: precompute inverse frequency vector theta_i = 1 / (10000^(2i/dim))
+           and register it as a buffer
+        2. In forward(q, k):
+           - Build position indices [0, 1, ..., seq_len-1]
+           - Compute angles: outer product of positions and freqs → [seq_len, dim//2]
+           - Build cos and sin caches
+           - Apply rotation: split q/k into pairs, rotate each pair by the angle
+             x_rot = x * cos + rotate_half(x) * sin
+           - Return rotated (q, k)
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 128):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        indexes = torch.arange(0, dim, 2).float()
+        inv_freq = 1. / (10000 ** (indexes / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to queries and keys.
+
+        Args:
+            q: [B, n_heads, N, d_head]
+            k: [B, n_heads, N, d_head]
+
+        Returns:
+            (q_rotated, k_rotated) with same shapes
+        """
+        B, n_heads, N, d_head = k.shape
+        pos = torch.arange(N, device=q.device, dtype=self.inv_freq.dtype)
+        thetas = pos[:, None] * self.inv_freq[None, :] # dim: [N, d_head//2]
+        thetas_cos = torch.cos(thetas)
+        thetas_sin = torch.sin(thetas)
+        q = q.view(B, n_heads, N, d_head // 2, 2)
+        q_x, q_y = q[..., 0], q[..., 1]
+
+        rq_x = q_x*thetas_cos - q_y*thetas_sin
+        rq_y = q_x*thetas_sin + q_y*thetas_cos
+        rq = torch.stack([rq_x, rq_y], dim=-1).view(B, n_heads, N, d_head)
+
+        k = k.view(B, n_heads, N, d_head // 2, 2)
+        k_x, k_y = k[..., 0], k[..., 1]
+
+        rk_x = k_x * thetas_cos - k_y * thetas_sin
+        rk_y = k_x * thetas_sin + k_y * thetas_cos
+        rk = torch.stack([rk_x, rk_y], dim=-1).view(B, n_heads, N, d_head)
+
+        return rq, rk
+
 class Dropout(nn.Module):
     def __init__(self, p: float):
         super().__init__()
@@ -51,6 +116,8 @@ class MHA(nn.Module):
         self.hidden_size = hidden_size
         self.d_heads = hidden_size // n_heads
 
+        self.rope = RoPE(dim=self.d_heads)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x dim: [B, N, D]
         B, N, _ = x.shape
@@ -61,6 +128,9 @@ class MHA(nn.Module):
         q_proj = q_proj.view(B, N, self.n_heads, self.d_heads).transpose(1, 2)  # [B, nh, N, dh]
         k_proj = k_proj.view(B, N, self.n_heads, self.d_heads).transpose(1, 2)  # [B, nh, N, dh]
         v_proj = v_proj.view(B, N, self.n_heads, self.d_heads).transpose(1, 2)  # [B, nh, N, dh]
+
+        # apply rotary position embeddings to Q and K
+        q_proj, k_proj = self.rope(q_proj, k_proj)
 
         attn_score = torch.matmul(q_proj, k_proj.transpose(-1, -2))  # [B, nh, N, N]
         attn_score = torch.softmax(attn_score / (self.d_heads ** 0.5), dim=-1)
