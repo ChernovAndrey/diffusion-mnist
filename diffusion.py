@@ -5,22 +5,24 @@ import torch.nn.functional as F
 
 
 class DiffusionNet(nn.Module):
-    def __init__(self, hidden_size, n_layers, n_heads, dropout_rate, mlp_size, T):
+    def __init__(self, token_dim, hidden_size, n_layers, n_heads, dropout_rate, mlp_size, T):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.in_proj = nn.Linear(token_dim, hidden_size)
         self.t_embed = nn.Embedding(T, hidden_size)
-
         self.transformer = Transformer(hidden_size, n_layers, n_heads, dropout_rate, mlp_size)
+        self.final_norm = nn.LayerNorm(hidden_size)
+        self.out_proj = nn.Linear(hidden_size, token_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, D], t: [B]
-        te = self.t_embed(t)          # [B, D]
-        te = te.unsqueeze(1)          # [B, 1, D]
-
-        # prepend time token — lets attention propagate time info to all layers
-        x = torch.cat([te, x], dim=1) # [B, N+1, D]
+        # x: [B, N, token_dim], t: [B]
+        x = self.in_proj(x)              # [B, N, hidden]
+        te = self.t_embed(t).unsqueeze(1) # [B, 1, hidden]
+        x = torch.cat([te, x], dim=1)    # [B, N+1, hidden]
         x = self.transformer(x)
-        return x[:, 1:, :]            # [B, N, D] — strip time token
+        x = x[:, 1:, :]                  # strip time token
+        return self.out_proj(self.final_norm(x))  # [B, N, token_dim]
 
 
 def cosine_alpha_bar(T: int, s: float = 0.008, device=None):
