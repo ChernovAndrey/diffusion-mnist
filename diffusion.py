@@ -38,6 +38,21 @@ def compute_alpha_bar(T: int, device=None):
     return betas, alphas, alpha_bar
 
 
+@torch.no_grad()
+def compute_latent_stats(ae, dataloader, device='cpu'):
+    """Compute per-channel mean and std of AE latents over the training set."""
+    ae.to(device)
+    ae.eval()
+    all_z = []
+    for x_img, _ in dataloader:
+        z = ae.encode(x_img.to(device))  # [B, 49, 64]
+        all_z.append(z)
+    all_z = torch.cat(all_z, dim=0)       # [N_total, 49, 64]
+    mean = all_z.mean(dim=(0, 1))          # [64]
+    std = all_z.std(dim=(0, 1))            # [64]
+    return mean, std
+
+
 def corrupt(x: torch.Tensor, t: torch.Tensor, alpha_bar: torch.Tensor):
     """
     x: [B, ...]
@@ -51,7 +66,7 @@ def corrupt(x: torch.Tensor, t: torch.Tensor, alpha_bar: torch.Tensor):
 
 
 @torch.no_grad()
-def sample(diff_model, ae, n_samples, T, n_tokens, token_dim, device='cpu'):
+def sample(diff_model, ae, n_samples, T, n_tokens, token_dim, latent_mean, latent_std, device='cpu'):
     """DDPM reverse sampling: noise → latent tokens → decoded images.
 
     Implements the reverse diffusion process to generate images:
@@ -97,12 +112,21 @@ def sample(diff_model, ae, n_samples, T, n_tokens, token_dim, device='cpu'):
         else:
             z = mean
 
+    # denormalize back to AE latent space
+    z = z * latent_std.to(device) + latent_mean.to(device)
     return torch.sigmoid(ae.decode(z))
 
-def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float, device="cpu"):
+def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
+                    latent_mean=None, latent_std=None, device="cpu"):
     diff_model.to(device)
     ae.to(device)
     ae.eval()  # freeze AE behavior
+
+    # compute latent stats if not provided
+    if latent_mean is None or latent_std is None:
+        latent_mean, latent_std = compute_latent_stats(ae, train_dataloader, device)
+    latent_mean = latent_mean.to(device)
+    latent_std = latent_std.to(device)
 
     # precompute schedule once
     betas, alphas, alpha_bar = compute_alpha_bar(T, device=device)
@@ -119,6 +143,7 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float, de
 
             with torch.no_grad():
                 z0 = ae.encode(x)  # [B, N, D]  (tokens)
+                z0 = (z0 - latent_mean) / latent_std  # normalize
 
             B = z0.size(0)
             t = torch.randint(0, T, (B,), device=device, dtype=torch.long)
