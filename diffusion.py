@@ -237,5 +237,7 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
         print(f"epoch {epoch}/{n_epochs} done - avg loss={total_loss / total_items:.4f}")
         scheduler.step()
 
-    # load EMA weights for sampling
+    # save raw training weights, then load EMA weights for sampling
+    raw_state = {k: v.clone() for k, v in diff_model.state_dict().items()}
     diff_model.load_state_dict(ema_params)
+    return raw_state  # caller can use this to compare EMA vs non-EMA
