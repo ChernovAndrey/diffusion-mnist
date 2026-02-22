@@ -152,7 +152,7 @@ class TransformerBlock(nn.Module):
         self.dropout2 = Dropout(dropout_rate)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_size, mlp_size),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(mlp_size, hidden_size)
         )
 

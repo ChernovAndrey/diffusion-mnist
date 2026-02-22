@@ -4,11 +4,33 @@ from transformer import Transformer
 import torch.nn.functional as F
 
 
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=t.device))
+            * torch.arange(half, device=t.device, dtype=torch.float32)
+            / max(half - 1, 1)
+        )
+        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.mlp(emb)
+
+
 class DiffusionNet(nn.Module):
     def __init__(self, token_dim, hidden_size, n_layers, n_heads, dropout_rate, mlp_size, T):
         super().__init__()
         self.in_proj = nn.Linear(token_dim, hidden_size)
-        self.t_embed = nn.Embedding(T, hidden_size)
+        self.t_embed = SinusoidalTimeEmbedding(hidden_size)
         self.transformer = Transformer(hidden_size, n_layers, n_heads, dropout_rate, mlp_size)
         self.final_norm = nn.LayerNorm(hidden_size)
         self.out_proj = nn.Linear(hidden_size, token_dim)
@@ -17,11 +39,10 @@ class DiffusionNet(nn.Module):
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         # x: [B, N, token_dim], t: [B]
-        x = self.in_proj(x)              # [B, N, hidden]
-        te = self.t_embed(t).unsqueeze(1) # [B, 1, hidden]
-        x = torch.cat([te, x], dim=1)    # [B, N+1, hidden]
+        x = self.in_proj(x)                # [B, N, hidden]
+        te = self.t_embed(t).unsqueeze(1)  # [B, 1, hidden]
+        x = x + te                         # add to every token (broadcast)
         x = self.transformer(x)
-        x = x[:, 1:, :]                  # strip time token
         return self.out_proj(self.final_norm(x))  # [B, N, token_dim]
 
 
@@ -134,6 +155,7 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
     betas, alphas, alpha_bar = compute_alpha_bar(T, device=device)
 
     opt = torch.optim.AdamW(diff_model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
 
     for epoch in range(1, n_epochs + 1):
         diff_model.train()
@@ -157,9 +179,11 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(diff_model.parameters(), 1.0)
             opt.step()
 
             total_loss += loss.item() * B
             total_items += B
 
         print(f"epoch {epoch}/{n_epochs} done - avg loss={total_loss / total_items:.4f}")
+        scheduler.step()
