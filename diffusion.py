@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformer import Transformer
+from transformer import MHA
 import torch.nn.functional as F
 
 
@@ -26,24 +26,67 @@ class SinusoidalTimeEmbedding(nn.Module):
         return self.mlp(emb)
 
 
+class DiTBlock(nn.Module):
+    """Transformer block with AdaLN-Zero conditioning (from DiT paper).
+
+    Instead of fixed LayerNorm params, each block's normalization is modulated
+    by the time embedding: norm(x) * (1 + gamma) + beta, with a gate (alpha)
+    on the residual. All modulation params zero-initialized so blocks start
+    as identity functions.
+    """
+    def __init__(self, hidden_size, n_heads, dropout_rate, mlp_size):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.attn = MHA(hidden_size, n_heads)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, mlp_size), nn.GELU(),
+            nn.Linear(mlp_size, hidden_size),
+        )
+        self.dropout = nn.Dropout(dropout_rate)
+        self.adaLN = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size),
+        )
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
+
+    def forward(self, x, c):
+        # c: [B, hidden_size] — time conditioning vector
+        g1, b1, a1, g2, b2, a2 = self.adaLN(c).unsqueeze(1).chunk(6, dim=-1)
+        h = self.norm1(x) * (1 + g1) + b1
+        x = x + a1 * self.dropout(self.attn(h))
+        h = self.norm2(x) * (1 + g2) + b2
+        x = x + a2 * self.dropout(self.ffn(h))
+        return x
+
+
 class DiffusionNet(nn.Module):
     def __init__(self, token_dim, hidden_size, n_layers, n_heads, dropout_rate, mlp_size, T):
         super().__init__()
         self.in_proj = nn.Linear(token_dim, hidden_size)
         self.t_embed = SinusoidalTimeEmbedding(hidden_size)
-        self.transformer = Transformer(hidden_size, n_layers, n_heads, dropout_rate, mlp_size)
-        self.final_norm = nn.LayerNorm(hidden_size)
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, n_heads, dropout_rate, mlp_size)
+            for _ in range(n_layers)
+        ])
+        self.final_norm = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.final_adaLN = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size),
+        )
+        nn.init.zeros_(self.final_adaLN[-1].weight)
+        nn.init.zeros_(self.final_adaLN[-1].bias)
         self.out_proj = nn.Linear(hidden_size, token_dim)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, token_dim], t: [B]
-        x = self.in_proj(x)                # [B, N, hidden]
-        te = self.t_embed(t).unsqueeze(1)  # [B, 1, hidden]
-        x = x + te                         # add to every token (broadcast)
-        x = self.transformer(x)
-        return self.out_proj(self.final_norm(x))  # [B, N, token_dim]
+    def forward(self, x, t):
+        x = self.in_proj(x)               # [B, N, hidden]
+        c = self.t_embed(t)               # [B, hidden]
+        for block in self.blocks:
+            x = block(x, c)
+        shift, scale = self.final_adaLN(c).unsqueeze(1).chunk(2, dim=-1)
+        x = self.final_norm(x) * (1 + scale) + shift
+        return self.out_proj(x)           # [B, N, token_dim]
 
 
 def cosine_alpha_bar(T: int, s: float = 0.008, device=None):
@@ -156,6 +199,8 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
 
     opt = torch.optim.AdamW(diff_model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    ema_decay = 0.999
+    ema_params = {k: v.clone() for k, v in diff_model.state_dict().items()}
 
     for epoch in range(1, n_epochs + 1):
         diff_model.train()
@@ -182,8 +227,15 @@ def train_diffusion(diff_model, ae, n_epochs, train_dataloader, T, lr: float,
             torch.nn.utils.clip_grad_norm_(diff_model.parameters(), 1.0)
             opt.step()
 
+            with torch.no_grad():
+                for k, v in diff_model.state_dict().items():
+                    ema_params[k].mul_(ema_decay).add_(v, alpha=1 - ema_decay)
+
             total_loss += loss.item() * B
             total_items += B
 
         print(f"epoch {epoch}/{n_epochs} done - avg loss={total_loss / total_items:.4f}")
         scheduler.step()
+
+    # load EMA weights for sampling
+    diff_model.load_state_dict(ema_params)
