@@ -13,11 +13,11 @@ Sampling:  pure noise → DiT denoises (100 steps) → denormalize → AE decode
 
 Compresses 28x28 images into a sequence of latent tokens for the diffusion model to operate on.
 
-**Encoder**: `[B, 1, 28, 28]` → Conv(1→32, stride 2) → ReLU → Conv(32→64, stride 2) → `[B, 64, 7, 7]`
+**Encoder**: `[B, 1, 28, 28]` → Conv(1→32, stride 2) → ReLU → Conv(32→6, stride 2) → `[B, 6, 7, 7]`
 
-The 7x7 spatial grid is reshaped into **49 tokens of dimension 64**: `[B, 64, 7, 7]` → permute → `[B, 49, 64]`
+The 7x7 spatial grid is reshaped into **49 tokens of dimension 6**: `[B, 6, 7, 7]` → permute → `[B, 49, 6]`
 
-**Decoder**: Inverse — reshape back to `[B, 64, 7, 7]`, then two transposed convolutions back to `[B, 1, 28, 28]`.
+**Decoder**: Inverse — reshape back to `[B, 6, 7, 7]`, then two transposed convolutions back to `[B, 1, 28, 28]`.
 
 The decoder outputs **logits** (no final activation). Training uses `BCEWithLogitsLoss`; sampling applies `sigmoid` to get pixel values in [0, 1].
 
@@ -28,8 +28,8 @@ This is a **plain autoencoder** (not a VAE) — no KL regularization. The latent
 Before diffusion training, we compute per-channel statistics over the full training set:
 
 ```
-mean = E[z]      over all samples and token positions, shape [64]
-std  = Std[z]    over all samples and token positions, shape [64]
+mean = E[z]      over all samples and token positions, shape [6]
+std  = Std[z]    over all samples and token positions, shape [6]
 ```
 
 Latents are normalized to approximately zero mean / unit variance:
@@ -142,16 +142,16 @@ x = x + alpha_2 * h                              ← gated residual
 ### Full DiffusionNet Architecture
 
 ```
-Input:  z_t [B, 49, 64]    (noisy latent tokens)
+Input:  z_t [B, 49, 6]     (noisy latent tokens)
         t   [B]             (integer timestep)
 
-1. in_proj:    z_t → Linear(64, 128)              → [B, 49, 128]
+1. in_proj:    z_t → Linear(6, 128)               → [B, 49, 128]
 2. t_embed:    t → sinusoidal(128) → MLP(128→512→128)  → c [B, 128]
 3. 4x DiTBlock(x, c):  AdaLN-Zero conditioned transformer layers
 4. final_adaLN: LayerNorm(x) * (1 + scale(c)) + shift(c)
-5. out_proj:   Linear(128, 64), zero-initialized   → [B, 49, 64]
+5. out_proj:   Linear(128, 6), zero-initialized    → [B, 49, 6]
 
-Output: predicted noise epsilon_pred [B, 49, 64]
+Output: predicted noise epsilon_pred [B, 49, 6]
 ```
 
 ### Sinusoidal Time Embedding
@@ -230,6 +230,16 @@ uv sync
 ```
 
 Then open `main.ipynb` and run all cells.
+
+## Latent Dimension: Why 6 Channels, Not 64
+
+The original implementation used `latent_channels=64`, giving 49x64 = 3,136 latent dimensions — a **4x expansion** of the 28x28x1 = 784 input pixels. The diffusion model (1.4M params) could denoise real images from heavy noise (starting near the data manifold) but failed to generate recognizable digits from pure Gaussian noise. The problem: navigating from random noise onto a thin data manifold in 3,136 dimensions is far harder than in a compressed space.
+
+Reducing to `latent_channels=6` gives 49x6 = 294 latent dimensions — a **~2.7x compression** of the input. This is enough capacity for the AE to reconstruct well, while making the diffusion model's job tractable: it only needs to learn the reverse process in 294 dimensions instead of 3,136.
+
+The key insight is that latent diffusion requires actual **compression**, not just a change of representation. This aligns with how production models work — e.g., NVIDIA's Cosmos uses a plain AE (not a VAE) with strong spatial compression, and the diffusion model works well because the latent space is genuinely lower-dimensional than the input.
+
+**Diagnostic that revealed the issue**: encoding real images, noising them to t=75 (heavy noise), and running the reverse process produced clear digits — proving the diffusion model had learned accurate denoising. But sampling from pure noise (t=T) produced fragmented output. This gap between "denoise from near the manifold" vs. "navigate to the manifold from scratch" is the hallmark of an insufficiently compressed latent space.
 
 ## Key References
 
